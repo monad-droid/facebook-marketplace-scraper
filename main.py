@@ -8,9 +8,10 @@ resold on eBay for a guaranteed 100%+ profit after fees and shipping.
 Only considers items that have actually sold on eBay in the past 7 days.
 
 Usage:
-    python main.py --queries "iphone 15" "macbook air" "ps5"
-    python main.py --queries "nintendo switch" --max-price 200
-    python main.py --queries "dyson vacuum" --min-profit 150
+    python login.py --remote       (first time only — log into Facebook)
+    python main.py                 (search default categories)
+    python main.py --queries "kitchenaid mixer" "le creuset"
+    python main.py --queries "snap on tools" --max-price 500
 """
 
 import argparse
@@ -32,26 +33,28 @@ from src.display import (
 
 console = Console()
 
-# Categories known to have good resale margins
+# Categories with good resale margins (non-electronics to avoid stolen goods)
 DEFAULT_QUERIES = [
-    "iphone 15",
-    "iphone 14",
-    "macbook pro",
-    "macbook air",
-    "playstation 5",
-    "xbox series x",
-    "nintendo switch oled",
-    "dyson vacuum",
-    "airpods pro",
-    "ipad pro",
-    "samsung galaxy s24",
-    "canon eos",
-    "sony a7",
     "kitchenaid mixer",
+    "dyson vacuum",
     "roomba",
+    "le creuset",
+    "vitamix blender",
+    "breville espresso",
+    "herman miller chair",
+    "steelcase chair",
+    "pottery barn furniture",
+    "restoration hardware",
+    "snap on tools",
+    "milwaukee tool set",
+    "dewalt tools",
+    "peloton bike",
+    "bowflex",
     "lego star wars",
-    "gpu rtx 4070",
-    "gpu rtx 4080",
+    "lego technic",
+    "yeti cooler",
+    "traeger grill",
+    "weber grill",
 ]
 
 

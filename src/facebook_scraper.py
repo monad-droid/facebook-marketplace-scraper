@@ -2,9 +2,12 @@
 Facebook Marketplace scraper using Playwright for browser automation.
 
 Scrapes listings under a given price threshold from Facebook Marketplace.
+Requires a one-time login to save cookies (run: python login.py).
 """
 
 import asyncio
+import json
+import os
 import random
 import re
 import logging
@@ -16,11 +19,11 @@ from src.models import MarketplaceListing
 
 logger = logging.getLogger(__name__)
 
-# Facebook Marketplace base URL
 FB_MARKETPLACE_URL = "https://www.facebook.com/marketplace"
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fb_cookies.json")
 
 
-def _build_search_url(query: str = "", max_price: int = None, location: str = None) -> str:
+def _build_search_url(query: str = "", max_price: int = None) -> str:
     """Build a Facebook Marketplace search URL with filters."""
     url = f"{FB_MARKETPLACE_URL}/search/?"
     params = []
@@ -33,6 +36,45 @@ def _build_search_url(query: str = "", max_price: int = None, location: str = No
     return url + "&".join(params)
 
 
+async def _load_cookies(context) -> bool:
+    """Load saved Facebook cookies into the browser context."""
+    if not os.path.exists(COOKIES_FILE):
+        logger.error(
+            f"No cookies file found at {COOKIES_FILE}. "
+            "Run 'python login.py' first to log into Facebook."
+        )
+        return False
+
+    try:
+        with open(COOKIES_FILE, "r") as f:
+            cookies = json.load(f)
+        await context.add_cookies(cookies)
+        logger.info(f"Loaded {len(cookies)} cookies from {COOKIES_FILE}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to load cookies: {e}")
+        return False
+
+
+async def _verify_login(page) -> bool:
+    """Check if we're actually logged into Facebook."""
+    try:
+        await page.goto("https://www.facebook.com", wait_until="domcontentloaded", timeout=15000)
+        await asyncio.sleep(2)
+
+        # If we see a login form, we're not logged in
+        login_form = await page.query_selector('input[name="email"]')
+        if login_form:
+            logger.error("Cookies are expired. Run 'python login.py' again to re-login.")
+            return False
+
+        logger.info("Facebook login verified")
+        return True
+    except Exception as e:
+        logger.error(f"Login verification failed: {e}")
+        return False
+
+
 async def scrape_marketplace(
     queries: list[str],
     max_price: int = None,
@@ -40,6 +82,8 @@ async def scrape_marketplace(
 ) -> list[MarketplaceListing]:
     """
     Scrape Facebook Marketplace for listings matching search queries.
+
+    Requires cookies from a prior login (run login.py first).
 
     Args:
         queries: List of search terms to look for.
@@ -60,8 +104,20 @@ async def scrape_marketplace(
         context = await browser.new_context(
             user_agent=random.choice(Config.USER_AGENTS),
             viewport={"width": 1920, "height": 1080},
+            locale="en-US",
         )
+
+        # Load saved cookies
+        if not await _load_cookies(context):
+            await browser.close()
+            return []
+
         page = await context.new_page()
+
+        # Verify we're actually logged in
+        if not await _verify_login(page):
+            await browser.close()
+            return []
 
         for query in queries:
             try:
@@ -94,24 +150,59 @@ async def _scrape_query(
     logger.info(f"Scraping: {url}")
 
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    await asyncio.sleep(random.uniform(2, 4))
+    await asyncio.sleep(random.uniform(3, 5))
+
+    # Close any popups/dialogs that Facebook likes to show
+    await _dismiss_popups(page)
 
     # Scroll to load more listings
     listings: list[MarketplaceListing] = []
     scroll_attempts = 0
     max_scrolls = 10
+    last_count = 0
+    stale_scrolls = 0
 
     while len(listings) < max_items and scroll_attempts < max_scrolls:
         # Parse listings currently visible on page
         new_listings = await _parse_listings(page, seen_urls)
         listings.extend(new_listings)
 
+        # Check if we're still finding new listings
+        if len(listings) == last_count:
+            stale_scrolls += 1
+            if stale_scrolls >= 3:
+                break  # No new listings after 3 scrolls, stop
+        else:
+            stale_scrolls = 0
+        last_count = len(listings)
+
         # Scroll down to trigger lazy loading
         await page.evaluate("window.scrollBy(0, window.innerHeight)")
-        await asyncio.sleep(random.uniform(1, 2.5))
+        await asyncio.sleep(random.uniform(1.5, 3))
         scroll_attempts += 1
 
     return listings[:max_items]
+
+
+async def _dismiss_popups(page) -> None:
+    """Dismiss common Facebook popups that block scraping."""
+    try:
+        # "Log in" dialog close button
+        close_buttons = await page.query_selector_all('[aria-label="Close"]')
+        for btn in close_buttons:
+            try:
+                await btn.click()
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+        # Cookie consent
+        cookie_btn = await page.query_selector('[data-cookiebanner="accept_button"]')
+        if cookie_btn:
+            await cookie_btn.click()
+            await asyncio.sleep(0.5)
+    except Exception:
+        pass
 
 
 async def _parse_listings(page, seen_urls: set[str]) -> list[MarketplaceListing]:
