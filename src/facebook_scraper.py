@@ -1,8 +1,10 @@
 """
 Facebook Marketplace scraper using Playwright for browser automation.
 
-Intercepts Facebook's GraphQL API responses to extract structured listing
-data, which is far more reliable than trying to parse the React-rendered DOM.
+Uses a multi-strategy approach:
+1. Intercepts ALL GraphQL/API responses for structured data
+2. Parses Relay prefetched stream cache from script tags
+3. Extracts from rendered DOM by finding price elements and their card containers
 
 Requires a one-time login to save cookies (run: python login.py).
 """
@@ -64,7 +66,6 @@ async def _verify_login(page) -> bool:
         await page.goto("https://www.facebook.com", wait_until="domcontentloaded", timeout=15000)
         await asyncio.sleep(2)
 
-        # If we see a login form, we're not logged in
         login_form = await page.query_selector('input[name="email"]')
         if login_form:
             logger.error("Cookies are expired. Run 'python login.py' again to re-login.")
@@ -85,8 +86,6 @@ async def scrape_marketplace(
     """
     Scrape Facebook Marketplace for listings matching search queries.
 
-    Intercepts Facebook's GraphQL API responses to get structured listing data.
-
     Args:
         queries: List of search terms to look for.
         max_price: Maximum price filter (defaults to config value).
@@ -102,7 +101,6 @@ async def scrape_marketplace(
     seen_urls: set[str] = set()
 
     async with async_playwright() as p:
-        # Use system chromium if available (avoids playwright browser version mismatch)
         launch_kwargs = {"headless": Config.HEADLESS}
         chromium_path = os.environ.get("PLAYWRIGHT_CHROMIUM_PATH")
         if not chromium_path:
@@ -119,7 +117,6 @@ async def scrape_marketplace(
             launch_kwargs["executable_path"] = chromium_path
             logger.info(f"Using chromium at: {chromium_path}")
 
-        # Anti-detection args
         launch_kwargs["args"] = [
             "--no-sandbox",
             "--disable-blink-features=AutomationControlled",
@@ -127,28 +124,24 @@ async def scrape_marketplace(
         ]
         browser = await p.chromium.launch(**launch_kwargs)
 
-        user_agent = random.choice(Config.USER_AGENTS)
         context = await browser.new_context(
-            user_agent=user_agent,
+            user_agent=random.choice(Config.USER_AGENTS),
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
         )
 
-        # Remove webdriver flag that Facebook checks for bot detection
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
             Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
         """)
 
-        # Load saved cookies
         if not await _load_cookies(context):
             await browser.close()
             return []
 
         page = await context.new_page()
 
-        # Verify we're actually logged in
         if not await _verify_login(page):
             await browser.close()
             return []
@@ -163,184 +156,12 @@ async def scrape_marketplace(
             except Exception as e:
                 logger.error(f"Error scraping query '{query}': {e}")
 
-            # Random delay between queries to avoid detection
             await asyncio.sleep(random.uniform(2, 5))
 
         await browser.close()
 
     logger.info(f"Total marketplace listings found: {len(all_listings)}")
     return all_listings
-
-
-def _extract_listings_from_graphql(data, seen_urls: set[str]) -> list[MarketplaceListing]:
-    """
-    Recursively extract marketplace listings from Facebook's GraphQL response.
-
-    Facebook nests listing data deeply and the structure varies, so we
-    search recursively for nodes that look like marketplace listings.
-    """
-    listings = []
-
-    if isinstance(data, dict):
-        # Check if this node is a marketplace listing
-        listing = _try_parse_listing_node(data, seen_urls)
-        if listing:
-            listings.append(listing)
-            return listings  # Don't recurse into a listing's own children
-
-        # Recurse into all dict values
-        for value in data.values():
-            listings.extend(_extract_listings_from_graphql(value, seen_urls))
-
-    elif isinstance(data, list):
-        for item in data:
-            listings.extend(_extract_listings_from_graphql(item, seen_urls))
-
-    return listings
-
-
-def _try_parse_listing_node(node: dict, seen_urls: set[str]) -> MarketplaceListing | None:
-    """
-    Try to parse a dict node as a marketplace listing.
-
-    Facebook GraphQL responses contain listing data in various shapes.
-    We look for common fields: id, listing_price, marketplace_listing_title, etc.
-    """
-    # Pattern 1: Direct listing node with marketplace_listing_title
-    listing_title = (
-        node.get("marketplace_listing_title")
-        or node.get("listing_title")
-        or node.get("name")
-    )
-
-    # Check for listing ID (indicates this is a listing node)
-    listing_id = node.get("id") or node.get("listing_id")
-
-    # Extract price from various locations
-    price = _extract_graphql_price(node)
-
-    # If we have title and price, this looks like a listing
-    if listing_title and price is not None and price > 0:
-        url = f"https://www.facebook.com/marketplace/item/{listing_id}" if listing_id else ""
-
-        if url:
-            clean_url = url.split("?")[0]
-            if clean_url in seen_urls:
-                return None
-            seen_urls.add(clean_url)
-
-        location = _extract_graphql_location(node)
-        image_url = _extract_graphql_image(node)
-
-        return MarketplaceListing(
-            title=listing_title,
-            price=price,
-            url=url,
-            location=location,
-            image_url=image_url,
-        )
-
-    # Pattern 2: Node wrapped in "node" or "listing" key
-    inner = node.get("node") or node.get("listing")
-    if isinstance(inner, dict) and inner is not node:
-        return _try_parse_listing_node(inner, seen_urls)
-
-    return None
-
-
-def _extract_graphql_price(node: dict) -> float | None:
-    """Extract price from a GraphQL listing node."""
-    # Try listing_price.formatted_amount ("$150")
-    listing_price = node.get("listing_price") or {}
-    if isinstance(listing_price, dict):
-        formatted = listing_price.get("formatted_amount") or listing_price.get("text", "")
-        if formatted:
-            match = re.search(r"[\d,]+(?:\.\d{2})?", formatted)
-            if match:
-                try:
-                    return float(match.group().replace(",", ""))
-                except ValueError:
-                    pass
-        # Try amount field (in cents or dollars)
-        amount = listing_price.get("amount")
-        if amount is not None:
-            try:
-                val = float(amount)
-                # Facebook sometimes uses cents
-                return val / 100 if val > 100000 else val
-            except (ValueError, TypeError):
-                pass
-
-    # Try price directly on node
-    price_val = node.get("price")
-    if isinstance(price_val, (int, float)) and price_val > 0:
-        return float(price_val)
-    if isinstance(price_val, str):
-        match = re.search(r"[\d,]+(?:\.\d{2})?", price_val)
-        if match:
-            try:
-                return float(match.group().replace(",", ""))
-            except ValueError:
-                pass
-
-    # Try formatted_price
-    formatted = node.get("formatted_price") or node.get("price_text", "")
-    if formatted:
-        match = re.search(r"[\d,]+(?:\.\d{2})?", str(formatted))
-        if match:
-            try:
-                return float(match.group().replace(",", ""))
-            except ValueError:
-                pass
-
-    return None
-
-
-def _extract_graphql_location(node: dict) -> str:
-    """Extract location from a GraphQL listing node."""
-    # Try location.reverse_geocode.city
-    loc = node.get("location") or {}
-    if isinstance(loc, dict):
-        city = loc.get("reverse_geocode", {}).get("city", "")
-        if city:
-            state = loc.get("reverse_geocode", {}).get("state", "")
-            return f"{city}, {state}" if state else city
-
-    # Try marketplace_listing_seller.location
-    seller = node.get("marketplace_listing_seller") or {}
-    if isinstance(seller, dict):
-        loc_name = seller.get("location", {})
-        if isinstance(loc_name, dict):
-            return loc_name.get("reverse_geocode", {}).get("city", "")
-
-    # Try location_text
-    return node.get("location_text", {}).get("text", "") if isinstance(node.get("location_text"), dict) else str(node.get("location_text", "") or "")
-
-
-def _extract_graphql_image(node: dict) -> str:
-    """Extract primary image URL from a GraphQL listing node."""
-    # Try primary_listing_photo
-    photo = node.get("primary_listing_photo") or node.get("primary_photo") or {}
-    if isinstance(photo, dict):
-        img = photo.get("image") or photo
-        if isinstance(img, dict):
-            return img.get("uri", "") or img.get("url", "")
-
-    # Try listing_photos array
-    photos = node.get("listing_photos") or node.get("photos") or []
-    if isinstance(photos, list) and photos:
-        first = photos[0]
-        if isinstance(first, dict):
-            img = first.get("image") or first
-            if isinstance(img, dict):
-                return img.get("uri", "") or img.get("url", "")
-
-    # Try image directly
-    img = node.get("image") or {}
-    if isinstance(img, dict):
-        return img.get("uri", "") or img.get("url", "")
-
-    return ""
 
 
 async def _scrape_query(
@@ -354,190 +175,504 @@ async def _scrape_query(
     url = _build_search_url(query=query, max_price=max_price)
     logger.info(f"Scraping: {url}")
 
-    # Collect GraphQL responses containing listing data
-    captured_responses: list[dict] = []
+    # Capture ALL API responses (not filtered by keywords)
+    captured_api_texts: list[str] = []
 
     async def _handle_response(response):
-        """Intercept API responses that contain marketplace listing data."""
         req_url = response.url
-        # Facebook uses /api/graphql/ for all data fetching
-        if "/api/graphql" not in req_url and "/graphql" not in req_url:
+        if "/api/graphql" not in req_url:
             return
         try:
             if response.status == 200:
                 text = await response.text()
-                # Facebook sometimes returns multiple JSON objects separated by newlines
-                for line in text.split("\n"):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                        # Only keep responses that look like they contain listings
-                        text_check = json.dumps(data)
-                        if "marketplace_listing_title" in text_check or "listing_price" in text_check or "marketplace_search" in text_check:
-                            captured_responses.append(data)
-                            logger.debug(f"Captured GraphQL response with marketplace data ({len(line)} bytes)")
-                    except json.JSONDecodeError:
-                        continue
-        except Exception as e:
-            logger.debug(f"Error reading response: {e}")
+                if text and len(text) > 100:
+                    captured_api_texts.append(text)
+        except Exception:
+            pass
 
-    # Set up response interception BEFORE navigating
     page.on("response", _handle_response)
 
     try:
-        # Navigate to the search page
         try:
             await page.goto(url, wait_until="networkidle", timeout=30000)
         except Exception:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        # Wait for content to load
-        await asyncio.sleep(random.uniform(3, 5))
-
-        # Close any popups
+        await asyncio.sleep(random.uniform(4, 6))
         await _dismiss_popups(page)
         await asyncio.sleep(1)
 
-        # Scroll to trigger more data loading
-        listings: list[MarketplaceListing] = []
-        scroll_attempts = 0
-        max_scrolls = 10
-
-        while len(listings) < max_items and scroll_attempts < max_scrolls:
-            # Parse listings from captured GraphQL responses
-            for resp_data in captured_responses:
-                new_listings = _extract_listings_from_graphql(resp_data, seen_urls)
-                listings.extend(new_listings)
-
-            # Clear processed responses
-            captured_responses.clear()
-
-            if len(listings) >= max_items:
-                break
-
-            # Scroll down to trigger lazy loading of more results
+        # Scroll a few times to load more content
+        for _ in range(5):
             await page.evaluate("window.scrollBy(0, window.innerHeight)")
             await asyncio.sleep(random.uniform(1.5, 3))
-            scroll_attempts += 1
 
-        # Process any remaining captured responses
-        for resp_data in captured_responses:
-            new_listings = _extract_listings_from_graphql(resp_data, seen_urls)
-            listings.extend(new_listings)
+        # Give time for final API responses
+        await asyncio.sleep(2)
 
-        # Fallback: try DOM-based extraction if GraphQL interception got nothing
+        listings: list[MarketplaceListing] = []
+
+        # Strategy 1: Parse Relay data from script tags (SSR data)
+        relay_listings = await _extract_from_relay_scripts(page, seen_urls)
+        if relay_listings:
+            logger.info(f"Relay script extraction found {len(relay_listings)} listings")
+            listings.extend(relay_listings)
+
+        # Strategy 2: Parse captured GraphQL API responses
         if not listings:
-            logger.debug("GraphQL interception found no listings, trying DOM extraction")
-            listings = await _parse_listings_from_dom(page, seen_urls)
+            for text in captured_api_texts:
+                api_listings = _parse_api_response_text(text, seen_urls)
+                listings.extend(api_listings)
+            if listings:
+                logger.info(f"API response extraction found {len(listings)} listings")
 
-        # Debug: if still no listings, save page info
+        # Strategy 3: Extract from rendered DOM
+        if not listings:
+            dom_listings = await _extract_from_rendered_dom(page, seen_urls)
+            if dom_listings:
+                logger.info(f"DOM extraction found {len(dom_listings)} listings")
+                listings.extend(dom_listings)
+
         if not listings:
             await _save_debug_info(page, query)
 
     finally:
-        # Clean up the response handler
         page.remove_listener("response", _handle_response)
 
     return listings[:max_items]
 
 
-async def _parse_listings_from_dom(page, seen_urls: set[str]) -> list[MarketplaceListing]:
+async def _extract_from_relay_scripts(page, seen_urls: set[str]) -> list[MarketplaceListing]:
     """
-    Fallback: extract listings from the DOM.
+    Extract listing data from Facebook's Relay prefetched stream cache.
 
-    Tries to find listing data embedded in script tags or visible elements.
+    Facebook embeds search results in <script type="application/json"> tags
+    using their Relay data format. We search through ALL script tags for
+    any JSON that contains price-like values and marketplace-related data.
     """
     listings = []
 
-    # Strategy A: Extract from __comet_data or relay store in script tags
     try:
-        script_data = await page.evaluate("""
+        # Extract all JSON script content that might contain listing data
+        raw_data_list = await page.evaluate("""
             () => {
-                // Try to find listing data in Facebook's inline data stores
                 const scripts = document.querySelectorAll('script[type="application/json"]');
                 const results = [];
                 for (const script of scripts) {
                     try {
                         const text = script.textContent;
-                        if (text && (text.includes('marketplace_listing_title') || text.includes('listing_price'))) {
-                            results.push(JSON.parse(text));
+                        if (!text) continue;
+                        // Only include scripts that have price-like patterns or marketplace refs
+                        if (text.includes('$') || text.includes('amount') ||
+                            text.includes('marketplace') || text.includes('Marketplace') ||
+                            text.includes('listing') || text.includes('Listing')) {
+                            const parsed = JSON.parse(text);
+                            results.push(parsed);
                         }
                     } catch(e) {}
-                }
-                // Also try window.__comet_data for SSR data
-                if (typeof __comet_data !== 'undefined') {
-                    try { results.push(__comet_data); } catch(e) {}
                 }
                 return results;
             }
         """)
-        for data in (script_data or []):
-            new_listings = _extract_listings_from_graphql(data, seen_urls)
-            listings.extend(new_listings)
-        if listings:
-            logger.debug(f"Script tag extraction found {len(listings)} listings")
-            return listings
-    except Exception as e:
-        logger.debug(f"Script extraction failed: {e}")
 
-    # Strategy B: Extract from visible DOM elements with price patterns
+        for data in (raw_data_list or []):
+            found = _deep_extract_listings(data, seen_urls)
+            listings.extend(found)
+
+    except Exception as e:
+        logger.debug(f"Relay script extraction error: {e}")
+
+    return listings
+
+
+def _parse_api_response_text(text: str, seen_urls: set[str]) -> list[MarketplaceListing]:
+    """Parse a raw API response text that may contain multiple JSON lines."""
+    listings = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+            found = _deep_extract_listings(data, seen_urls)
+            listings.extend(found)
+        except json.JSONDecodeError:
+            continue
+    return listings
+
+
+def _deep_extract_listings(data, seen_urls: set[str], depth=0) -> list[MarketplaceListing]:
+    """
+    Recursively search through arbitrarily nested data for listing-like objects.
+
+    A listing is identified by having:
+    - A numeric ID (the listing ID)
+    - A price (in any format: amount, formatted_amount, text with $)
+    - A title/name string
+
+    Facebook's Relay format nests data deeply and uses various key names,
+    so we try many combinations.
+    """
+    if depth > 20:
+        return []
+
+    listings = []
+
+    if isinstance(data, dict):
+        listing = _try_extract_single_listing(data, seen_urls)
+        if listing:
+            return [listing]
+
+        for value in data.values():
+            listings.extend(_deep_extract_listings(value, seen_urls, depth + 1))
+
+    elif isinstance(data, list):
+        for item in data:
+            listings.extend(_deep_extract_listings(item, seen_urls, depth + 1))
+
+    return listings
+
+
+def _try_extract_single_listing(node: dict, seen_urls: set[str]) -> MarketplaceListing | None:
+    """
+    Check if a dict node represents a marketplace listing.
+
+    Tries many possible Facebook field name patterns.
+    """
+    if not isinstance(node, dict):
+        return None
+
+    # --- Extract title ---
+    title = None
+    for key in [
+        "marketplace_listing_title", "listing_title",
+        "marketplace_listing_name",
+    ]:
+        if key in node and isinstance(node[key], str) and len(node[key]) > 2:
+            title = node[key]
+            break
+
+    # Also check 'name' but only if it looks like a product title (not a person)
+    if not title and "name" in node and isinstance(node["name"], str):
+        name = node["name"]
+        # Must have other listing-like fields to use 'name'
+        has_price_field = any(k in node for k in [
+            "listing_price", "price", "formatted_price",
+            "price_amount", "current_price",
+        ])
+        has_listing_field = any(k in node for k in [
+            "listing_id", "marketplace_listing_title",
+            "primary_listing_photo", "listing_photos",
+            "delivery_types", "marketplace_listing_category_id",
+            "marketplace_listing_seller", "is_live",
+            "creation_time", "custom_title",
+        ])
+        if has_price_field or has_listing_field:
+            title = name
+
+    # Check nested: node.listing.title or node.node.title
+    if not title:
+        for wrapper_key in ["node", "listing", "target"]:
+            inner = node.get(wrapper_key)
+            if isinstance(inner, dict) and inner is not node:
+                result = _try_extract_single_listing(inner, seen_urls)
+                if result:
+                    return result
+
+    if not title:
+        return None
+
+    # --- Extract price ---
+    price = _extract_price_from_node(node)
+    if price is None or price <= 0:
+        return None
+
+    # --- Extract ID and build URL ---
+    listing_id = None
+    for key in ["id", "listing_id", "marketplace_listing_id", "pk"]:
+        val = node.get(key)
+        if val is not None:
+            listing_id = str(val)
+            break
+
+    if listing_id:
+        url = f"https://www.facebook.com/marketplace/item/{listing_id}"
+        clean_url = url.split("?")[0]
+        if clean_url in seen_urls:
+            return None
+        seen_urls.add(clean_url)
+    else:
+        url = ""
+
+    # --- Extract location ---
+    location = _extract_location_from_node(node)
+
+    # --- Extract image ---
+    image_url = _extract_image_from_node(node)
+
+    return MarketplaceListing(
+        title=title,
+        price=price,
+        url=url,
+        location=location,
+        image_url=image_url,
+    )
+
+
+def _extract_price_from_node(node: dict) -> float | None:
+    """Try every known way Facebook encodes prices."""
+    # Direct price fields
+    for price_key in ["listing_price", "price", "current_price", "price_amount"]:
+        val = node.get(price_key)
+        if val is None:
+            continue
+
+        if isinstance(val, dict):
+            # Try formatted_amount, text, amount
+            for text_key in ["formatted_amount", "text", "formatted_amount_with_offset_and_symbol"]:
+                text_val = val.get(text_key, "")
+                if text_val:
+                    parsed = _parse_price_string(str(text_val))
+                    if parsed is not None:
+                        return parsed
+            # Try numeric amount
+            amount = val.get("amount")
+            if amount is not None:
+                try:
+                    v = float(amount)
+                    return v / 100 if v > 100000 else v
+                except (ValueError, TypeError):
+                    pass
+            # Try currency_amount
+            amount = val.get("currency_amount")
+            if amount is not None:
+                try:
+                    return float(amount)
+                except (ValueError, TypeError):
+                    pass
+
+        elif isinstance(val, (int, float)):
+            v = float(val)
+            if v > 0:
+                return v
+
+        elif isinstance(val, str):
+            parsed = _parse_price_string(val)
+            if parsed is not None:
+                return parsed
+
+    # Try formatted_price, price_text
+    for key in ["formatted_price", "price_text"]:
+        val = node.get(key)
+        if val:
+            if isinstance(val, dict):
+                val = val.get("text", "") or val.get("formatted_amount", "")
+            parsed = _parse_price_string(str(val))
+            if parsed is not None:
+                return parsed
+
+    return None
+
+
+def _parse_price_string(s: str) -> float | None:
+    """Parse a price from a string like '$30', '$1,500.00', '150'."""
+    match = re.search(r"\$?([\d,]+(?:\.\d{2})?)", s)
+    if match:
+        try:
+            return float(match.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return None
+
+
+def _extract_location_from_node(node: dict) -> str:
+    """Extract location from a listing node."""
+    # Try location.reverse_geocode
+    loc = node.get("location")
+    if isinstance(loc, dict):
+        rg = loc.get("reverse_geocode")
+        if isinstance(rg, dict):
+            city = rg.get("city", "")
+            state = rg.get("state", "")
+            if city:
+                return f"{city}, {state}" if state else city
+
+    # Try location_text
+    lt = node.get("location_text")
+    if isinstance(lt, dict):
+        return lt.get("text", "")
+    if isinstance(lt, str):
+        return lt
+
+    # Try marketplace_listing_seller.location
+    seller = node.get("marketplace_listing_seller")
+    if isinstance(seller, dict):
+        sloc = seller.get("location")
+        if isinstance(sloc, dict):
+            rg = sloc.get("reverse_geocode", {})
+            return rg.get("city", "")
+
+    return ""
+
+
+def _extract_image_from_node(node: dict) -> str:
+    """Extract primary image URL from a listing node."""
+    # Try primary_listing_photo, primary_photo, curratedPhoto
+    for photo_key in ["primary_listing_photo", "primary_photo", "photo", "curated_photo"]:
+        photo = node.get(photo_key)
+        if isinstance(photo, dict):
+            img = photo.get("image") or photo.get("photo") or photo
+            if isinstance(img, dict):
+                uri = img.get("uri") or img.get("url") or img.get("src", "")
+                if uri:
+                    return uri
+
+    # Try listing_photos, photos array
+    for photos_key in ["listing_photos", "photos"]:
+        photos = node.get(photos_key)
+        if isinstance(photos, list) and photos:
+            first = photos[0]
+            if isinstance(first, dict):
+                img = first.get("image") or first
+                if isinstance(img, dict):
+                    return img.get("uri") or img.get("url", "")
+
+    # Try image directly
+    img = node.get("image")
+    if isinstance(img, dict):
+        return img.get("uri") or img.get("url", "")
+
+    return ""
+
+
+async def _extract_from_rendered_dom(page, seen_urls: set[str]) -> list[MarketplaceListing]:
+    """
+    Extract listings from the rendered page by finding price elements
+    and walking up the DOM to find their containing card.
+
+    This works regardless of Facebook's class names or href patterns.
+    """
+    listings = []
+
     try:
         card_data = await page.evaluate("""
             () => {
                 const results = [];
-                // Look for any anchor with marketplace href patterns
-                const allLinks = document.querySelectorAll('a[href]');
-                for (const link of allLinks) {
-                    const href = link.href || link.getAttribute('href') || '';
-                    // Match marketplace item links or generic item links
-                    if (href.includes('/marketplace/item/') || href.includes('/item/')) {
-                        const text = link.innerText || '';
-                        const img = link.querySelector('img');
-                        const imgSrc = img ? (img.src || '') : '';
-                        results.push({href, text, imgSrc});
+                const seen = new Set();
+
+                // Find ALL text nodes that show a price ($XX)
+                const walker = document.createTreeWalker(
+                    document.body,
+                    NodeFilter.SHOW_TEXT,
+                    {
+                        acceptNode: (node) => {
+                            const text = node.textContent.trim();
+                            if (/^\\$\\d/.test(text) && text.length < 20) {
+                                return NodeFilter.FILTER_ACCEPT;
+                            }
+                            return NodeFilter.FILTER_REJECT;
+                        }
                     }
+                );
+
+                const priceNodes = [];
+                while (walker.nextNode()) {
+                    priceNodes.push(walker.currentNode);
                 }
-                // Also look for divs with item data
-                if (results.length === 0) {
-                    const divs = document.querySelectorAll('div[class]');
-                    for (const div of divs) {
-                        const text = div.innerText || '';
-                        if (!/\\$\\d/.test(text)) continue;
-                        if (text.length > 500 || text.length < 5) continue;
-                        const link = div.closest('a') || div.querySelector('a');
-                        if (!link) continue;
-                        const href = link.href || '';
-                        if (!href) continue;
-                        const img = div.querySelector('img');
-                        const imgSrc = img ? (img.src || '') : '';
-                        results.push({href, text, imgSrc});
+
+                for (const priceNode of priceNodes) {
+                    // Walk up to find the card container
+                    // A card is typically a div that's roughly 200-500px wide
+                    let card = priceNode.parentElement;
+                    let foundCard = null;
+                    let attempts = 0;
+
+                    while (card && attempts < 15) {
+                        const rect = card.getBoundingClientRect();
+                        // A listing card is typically between 150-600px wide
+                        if (rect.width > 150 && rect.width < 600 && rect.height > 100) {
+                            // Check if this card has an image (listing cards always have images)
+                            const img = card.querySelector('img');
+                            if (img) {
+                                foundCard = card;
+                                break;
+                            }
+                        }
+                        card = card.parentElement;
+                        attempts++;
                     }
+
+                    if (!foundCard) continue;
+
+                    // Deduplicate by card element
+                    const cardId = foundCard.getAttribute('data-debug-id') ||
+                                   foundCard.className.substring(0, 50) + foundCard.getBoundingClientRect().top;
+                    if (seen.has(cardId)) continue;
+                    seen.add(cardId);
+
+                    // Extract data from the card
+                    const text = foundCard.innerText || '';
+                    const img = foundCard.querySelector('img');
+                    const imgSrc = img ? (img.src || '') : '';
+
+                    // Find any link in or around the card
+                    let href = '';
+                    const link = foundCard.querySelector('a[href]') || foundCard.closest('a[href]');
+                    if (link) {
+                        href = link.href || link.getAttribute('href') || '';
+                    }
+
+                    // Also check parent links
+                    if (!href) {
+                        let parent = foundCard.parentElement;
+                        for (let i = 0; i < 5 && parent; i++) {
+                            if (parent.tagName === 'A' && parent.href) {
+                                href = parent.href;
+                                break;
+                            }
+                            const parentLink = parent.querySelector('a[href]');
+                            if (parentLink) {
+                                href = parentLink.href || '';
+                                break;
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+
+                    results.push({
+                        text: text.substring(0, 500),
+                        href: href,
+                        imgSrc: imgSrc,
+                        priceText: priceNode.textContent.trim(),
+                    });
                 }
+
                 return results;
             }
         """)
+
         for item in (card_data or []):
             try:
+                price_text = item.get("priceText", "")
+                price = _parse_price_string(price_text)
+                if price is None or price <= 0:
+                    continue
+
                 href = item.get("href", "")
-                if not href:
-                    continue
-                if href.startswith("/"):
+                if href and href.startswith("/"):
                     href = f"https://www.facebook.com{href}"
-                clean_url = href.split("?")[0]
-                if clean_url in seen_urls:
-                    continue
-                seen_urls.add(clean_url)
+                clean_url = href.split("?")[0] if href else ""
+
+                if clean_url:
+                    if clean_url in seen_urls:
+                        continue
+                    seen_urls.add(clean_url)
 
                 text_content = item.get("text", "")
                 lines = [l.strip() for l in text_content.split("\n") if l.strip()]
-                price = _extract_dom_price(lines)
+
                 title = _extract_dom_title(lines)
                 location = _extract_dom_location(lines)
-
-                if price is None or price <= 0:
-                    continue
 
                 listing = MarketplaceListing(
                     title=title,
@@ -547,10 +682,12 @@ async def _parse_listings_from_dom(page, seen_urls: set[str]) -> list[Marketplac
                     image_url=item.get("imgSrc", ""),
                 )
                 listings.append(listing)
+
             except Exception as e:
                 logger.debug(f"Error parsing DOM card: {e}")
+
     except Exception as e:
-        logger.debug(f"DOM extraction failed: {e}")
+        logger.debug(f"Rendered DOM extraction failed: {e}")
 
     return listings
 
@@ -612,53 +749,34 @@ async def _save_debug_info(page, query: str) -> None:
     except Exception as e:
         logger.debug(f"Failed to save HTML: {e}")
 
-    # Check for marketplace data in various selectors
-    selectors_to_try = [
-        'a[href*="/marketplace/item/"]',
-        'a[href*="marketplace"]',
-        'a[href*="/item/"]',
-        'script[type="application/json"]',
-    ]
-    for sel in selectors_to_try:
-        try:
-            elements = await page.query_selector_all(sel)
-            logger.warning(f"Debug selector '{sel}' found {len(elements)} elements")
-        except Exception:
-            pass
-
-    # Check for any embedded listing data in scripts
+    # Check for rendered price elements
     try:
-        has_data = await page.evaluate("""
+        price_info = await page.evaluate("""
             () => {
-                const html = document.documentElement.innerHTML;
-                return {
-                    has_listing_title: html.includes('marketplace_listing_title'),
-                    has_listing_price: html.includes('listing_price'),
-                    has_search_results: html.includes('marketplace_search'),
-                    has_item_id: html.includes('marketplace/item'),
-                    total_scripts: document.querySelectorAll('script').length,
-                    json_scripts: document.querySelectorAll('script[type="application/json"]').length,
-                };
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_TEXT,
+                    { acceptNode: (n) => /^\\$\\d/.test(n.textContent.trim()) ?
+                        NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT }
+                );
+                const prices = [];
+                while (walker.nextNode()) {
+                    const node = walker.currentNode;
+                    const parent = node.parentElement;
+                    prices.push({
+                        price: node.textContent.trim(),
+                        parentTag: parent ? parent.tagName : 'none',
+                        parentClass: parent ? parent.className.substring(0, 50) : '',
+                        visible: parent ? parent.offsetParent !== null : false,
+                    });
+                }
+                return {count: prices.length, samples: prices.slice(0, 10)};
             }
         """)
-        logger.warning(f"Debug page data indicators: {has_data}")
+        logger.warning(f"Debug: Found {price_info['count']} rendered price elements")
+        for p in price_info.get('samples', []):
+            logger.warning(f"  {p['price']} in <{p['parentTag']}> visible={p['visible']} class={p['parentClass']}")
     except Exception as e:
-        logger.debug(f"Failed to check page data: {e}")
-
-
-# DOM-based price/title/location extraction (fallback)
-
-def _extract_dom_price(lines: list[str]) -> float | None:
-    """Extract price from listing text lines."""
-    for line in lines:
-        match = re.search(r"\$[\d,]+(?:\.\d{2})?", line)
-        if match:
-            price_str = match.group().replace("$", "").replace(",", "")
-            try:
-                return float(price_str)
-            except ValueError:
-                continue
-    return None
+        logger.debug(f"Failed to check prices: {e}")
 
 
 def _extract_dom_title(lines: list[str]) -> str:
