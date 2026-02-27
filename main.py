@@ -33,28 +33,51 @@ from src.display import (
 
 console = Console()
 
-# Categories with good resale margins (non-electronics to avoid stolen goods)
+# High-margin categories with specific model numbers for accurate eBay matching
 DEFAULT_QUERIES = [
-    "kitchenaid mixer",
-    "dyson vacuum",
-    "roomba",
-    "le creuset",
-    "vitamix blender",
-    "breville espresso",
-    "herman miller chair",
-    "steelcase chair",
-    "pottery barn furniture",
-    "restoration hardware",
-    "snap on tools",
-    "milwaukee tool set",
-    "dewalt tools",
-    "peloton bike",
-    "bowflex",
-    "lego star wars",
-    "lego technic",
-    "yeti cooler",
-    "traeger grill",
-    "weber grill",
+    # Power tools — exact brands, high demand
+    "DeWalt power tool",
+    "Milwaukee M18",
+    "Makita drill",
+    "Ridgid tool",
+    "Bosch power tool",
+    "Snap On tools",
+    # Camera bodies + lenses — structured market, model-specific
+    "Canon EOS R6",
+    "Sony A7III",
+    "Sony A7 IV",
+    "Sigma 35mm",
+    "Canon RF lens",
+    "Sony GM lens",
+    # Game consoles — exact SKU matching
+    "PS5 console",
+    "Xbox Series X",
+    "Nintendo Switch OLED",
+    # Laptops — model numbers everywhere, 30-80% margins
+    "MacBook Air M1",
+    "MacBook Pro M2",
+    "MacBook Pro M3",
+    "ThinkPad T480",
+    "ThinkPad X1 Carbon",
+    # Networking / home office — niche, precise matching, good margins
+    "Ubiquiti access point",
+    "Synology NAS",
+    "UniFi switch",
+    # Audio equipment — model-specific, audiophiles pay up
+    "Denon receiver",
+    "Yamaha receiver",
+    "Marantz receiver",
+    "turntable",
+    # Video games — retro titles flip for $30-$120 each
+    "N64 games",
+    "GameCube games",
+    "Sega Genesis games",
+    "PS2 games lot",
+    # Small kitchen appliances — exact models, tight comps
+    "KitchenAid Artisan",
+    "Vitamix 5200",
+    "Breville Barista Express",
+    "Le Creuset",
 ]
 
 
