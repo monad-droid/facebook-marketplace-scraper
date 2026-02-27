@@ -1,130 +1,107 @@
 #!/usr/bin/env python3
 """
-One-time Facebook login script.
+One-time Facebook cookie setup.
 
-Opens a browser with remote debugging so you can log into Facebook
-from your local machine via SSH tunnel. Saves cookies for the scraper.
+Grabs your Facebook session cookies from your local browser
+and saves them for the scraper to use.
 
-Usage (on your server):
+Usage:
     python login.py
 
-Then from your local machine:
-    ssh -L 9222:localhost:9222 root@YOUR_SERVER_IP
-
-Then open http://localhost:9222 in your local browser to control the
-remote Chrome, log into Facebook, and press Enter in the server terminal.
+    Follow the on-screen instructions to copy cookies from your browser.
 """
 
-import asyncio
 import json
-import subprocess
-import shutil
-import sys
-import argparse
-
-from playwright.async_api import async_playwright
 
 COOKIES_FILE = "fb_cookies.json"
 
 
-def _ensure_xvfb():
-    """Install xvfb if not present."""
-    if shutil.which("Xvfb") or shutil.which("xvfb-run"):
-        return True
-    print("  Installing xvfb (virtual display for headless server)...")
-    result = subprocess.run(
-        ["apt", "install", "-y", "xvfb"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"  Failed to install xvfb: {result.stderr}")
-        print("  Try manually: sudo apt install -y xvfb")
-        return False
-    return True
-
-
-async def login_remote(port: int) -> None:
-    """Launch browser with xvfb + remote debugging for headless servers."""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            args=[
-                "--no-sandbox",
-                f"--remote-debugging-port={port}",
-                "--remote-debugging-address=0.0.0.0",
-            ],
-        )
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            locale="en-US",
-        )
-        page = await context.new_page()
-
-        await page.goto("https://www.facebook.com/login", wait_until="domcontentloaded")
-
-        print("\n" + "=" * 60)
-        print("  REMOTE FACEBOOK LOGIN")
-        print("=" * 60)
-        print()
-        print(f"  Browser is running on port {port}.")
-        print()
-        print("  FROM YOUR LOCAL MACHINE, open a new terminal and run:")
-        print(f"    ssh -L {port}:localhost:{port} root@YOUR_SERVER_IP")
-        print()
-        print(f"  Then open your local browser and go to:")
-        print(f"    http://localhost:{port}")
-        print()
-        print("  You'll see a list of open tabs. Click the Facebook")
-        print("  login page to control the remote browser.")
-        print("  Log into your Facebook account.")
-        print()
-        print("  After logging in, come back here and press ENTER.")
-        print("=" * 60)
-
-        input("\n  Press ENTER after you've logged in... ")
-
-        cookies = await context.cookies()
-        with open(COOKIES_FILE, "w") as f:
-            json.dump(cookies, f, indent=2)
-
-        print(f"\n  Saved {len(cookies)} cookies to {COOKIES_FILE}")
-        print("  You can now run: python main.py")
-        print()
-
-        await browser.close()
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Log into Facebook and save cookies")
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=9222,
-        help="Remote debugging port (default: 9222)",
-    )
-    args = parser.parse_args()
+    print()
+    print("=" * 60)
+    print("  FACEBOOK COOKIE SETUP")
+    print("=" * 60)
+    print()
+    print("  We need 2 cookies from your Facebook session.")
+    print("  This is a one-time setup.")
+    print()
+    print("  STEPS:")
+    print()
+    print("  1. Open Facebook in your browser and make sure")
+    print("     you're logged in")
+    print()
+    print("  2. Open DevTools (F12 or right-click > Inspect)")
+    print()
+    print("  3. Go to the 'Application' tab (Chrome/Brave)")
+    print("     or 'Storage' tab (Firefox)")
+    print()
+    print("  4. In the left sidebar, click 'Cookies' then")
+    print("     'https://www.facebook.com'")
+    print()
+    print("  5. Find these 2 cookies and copy their values:")
+    print("     - c_user")
+    print("     - xs")
+    print()
+    print("=" * 60)
+    print()
 
-    # Headless server needs a virtual display
-    if not _ensure_xvfb():
-        sys.exit(1)
+    c_user = input("  Paste your 'c_user' cookie value: ").strip()
+    if not c_user:
+        print("  ERROR: c_user cannot be empty")
+        return
 
-    # Re-exec under xvfb-run if DISPLAY is not set
-    import os
-    if "DISPLAY" not in os.environ:
-        print("  Starting virtual display with xvfb-run...")
-        xvfb_path = shutil.which("xvfb-run")
-        if not xvfb_path:
-            print("  ERROR: xvfb-run not found. Install with: apt install xvfb")
-            sys.exit(1)
-        os.execvp(xvfb_path, [
-            xvfb_path,
-            "--auto-servernum",
-            "--server-args=-screen 0 1920x1080x24",
-            sys.executable, *sys.argv,
-        ])
+    xs = input("  Paste your 'xs' cookie value: ").strip()
+    if not xs:
+        print("  ERROR: xs cannot be empty")
+        return
 
-    # If we get here, DISPLAY is set (either real or from xvfb-run)
-    asyncio.run(login_remote(args.port))
+    # Build cookie objects in Playwright format
+    cookies = [
+        {
+            "name": "c_user",
+            "value": c_user,
+            "domain": ".facebook.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": False,
+            "sameSite": "None",
+        },
+        {
+            "name": "xs",
+            "value": xs,
+            "domain": ".facebook.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": True,
+            "sameSite": "None",
+        },
+        {
+            "name": "datr",
+            "value": "placeholder",
+            "domain": ".facebook.com",
+            "path": "/",
+            "secure": True,
+            "httpOnly": True,
+            "sameSite": "None",
+        },
+    ]
+
+    # Also ask for datr if they have it (optional but helps)
+    print()
+    datr = input("  Paste your 'datr' cookie value (optional, press Enter to skip): ").strip()
+    if datr:
+        cookies[2]["value"] = datr
+    else:
+        cookies.pop(2)  # Remove the placeholder
+
+    with open(COOKIES_FILE, "w") as f:
+        json.dump(cookies, f, indent=2)
+
+    print()
+    print(f"  Saved cookies to {COOKIES_FILE}")
+    print()
+    print("  You can now run: python main.py --verbose")
+    print()
 
 
 if __name__ == "__main__":
