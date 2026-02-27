@@ -100,12 +100,45 @@ async def scrape_marketplace(
     seen_urls: set[str] = set()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=Config.HEADLESS)
+        # Use system chromium if available (avoids playwright browser version mismatch)
+        launch_kwargs = {"headless": Config.HEADLESS}
+        chromium_path = os.environ.get("PLAYWRIGHT_CHROMIUM_PATH")
+        if not chromium_path:
+            # Try common locations for pre-installed chromium
+            for candidate in [
+                "/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/chromium",
+                "/usr/bin/google-chrome-stable",
+            ]:
+                if os.path.exists(candidate):
+                    chromium_path = candidate
+                    break
+        if chromium_path:
+            launch_kwargs["executable_path"] = chromium_path
+            logger.info(f"Using chromium at: {chromium_path}")
+
+        # Anti-detection: add args to make headless chrome look more normal
+        launch_kwargs["args"] = [
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ]
+        browser = await p.chromium.launch(**launch_kwargs)
+
+        user_agent = random.choice(Config.USER_AGENTS)
         context = await browser.new_context(
-            user_agent=random.choice(Config.USER_AGENTS),
+            user_agent=user_agent,
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
         )
+
+        # Remove webdriver flag that Facebook checks for bot detection
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        """)
 
         # Load saved cookies
         if not await _load_cookies(context):
@@ -149,11 +182,19 @@ async def _scrape_query(
     url = _build_search_url(query=query, max_price=max_price)
     logger.info(f"Scraping: {url}")
 
-    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    # Use networkidle to wait for React/JS to finish rendering content
+    try:
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+    except Exception:
+        # Fallback if networkidle times out (Facebook streams data)
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     await asyncio.sleep(random.uniform(3, 5))
 
     # Close any popups/dialogs that Facebook likes to show
     await _dismiss_popups(page)
+
+    # Wait a moment for any popup dismissal to settle
+    await asyncio.sleep(1)
 
     # Scroll to load more listings
     listings: list[MarketplaceListing] = []
@@ -181,21 +222,88 @@ async def _scrape_query(
         await asyncio.sleep(random.uniform(1.5, 3))
         scroll_attempts += 1
 
+    # Debug: if no listings found, save page info for troubleshooting
+    if not listings:
+        await _save_debug_info(page, query)
+
     return listings[:max_items]
+
+
+async def _save_debug_info(page, query: str) -> None:
+    """Save screenshot and HTML when no listings are found, for debugging."""
+    debug_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "debug")
+    os.makedirs(debug_dir, exist_ok=True)
+
+    slug = re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")
+
+    # Log current URL and title (detect redirects)
+    try:
+        current_url = page.url
+        title = await page.title()
+        logger.warning(f"Debug: Current URL: {current_url}")
+        logger.warning(f"Debug: Page title: {title}")
+    except Exception:
+        pass
+
+    # Save screenshot
+    try:
+        screenshot_path = os.path.join(debug_dir, f"{slug}_screenshot.png")
+        await page.screenshot(path=screenshot_path, full_page=True)
+        logger.warning(f"Debug screenshot saved: {screenshot_path}")
+    except Exception as e:
+        logger.debug(f"Failed to save screenshot: {e}")
+
+    # Save page HTML
+    try:
+        html_path = os.path.join(debug_dir, f"{slug}_page.html")
+        html = await page.content()
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        logger.warning(f"Debug HTML saved: {html_path}")
+    except Exception as e:
+        logger.debug(f"Failed to save HTML: {e}")
+
+    # Log what selectors find
+    selectors_to_try = [
+        'a[href*="/marketplace/item/"]',
+        'a[href*="marketplace"]',
+        'div[class*="marketplace"]',
+        'a[href*="/item/"]',
+        '[data-testid]',
+    ]
+    for sel in selectors_to_try:
+        try:
+            elements = await page.query_selector_all(sel)
+            logger.warning(f"Debug selector '{sel}' found {len(elements)} elements")
+        except Exception:
+            pass
+
+    # Log all unique href patterns on the page
+    try:
+        hrefs = await page.evaluate("""
+            () => {
+                const links = document.querySelectorAll('a[href]');
+                const patterns = new Set();
+                for (const link of links) {
+                    const href = link.getAttribute('href');
+                    if (href && href.includes('marketplace')) {
+                        patterns.add(href.substring(0, 80));
+                    }
+                }
+                return [...patterns].slice(0, 20);
+            }
+        """)
+        if hrefs:
+            logger.warning(f"Debug marketplace hrefs found: {hrefs}")
+        else:
+            logger.warning("Debug: No marketplace hrefs found on page at all")
+    except Exception as e:
+        logger.debug(f"Failed to extract hrefs: {e}")
 
 
 async def _dismiss_popups(page) -> None:
     """Dismiss common Facebook popups that block scraping."""
     try:
-        # "Log in" dialog close button
-        close_buttons = await page.query_selector_all('[aria-label="Close"]')
-        for btn in close_buttons:
-            try:
-                await btn.click()
-                await asyncio.sleep(0.5)
-            except Exception:
-                pass
-
         # Cookie consent
         cookie_btn = await page.query_selector('[data-cookiebanner="accept_button"]')
         if cookie_btn:
@@ -204,17 +312,159 @@ async def _dismiss_popups(page) -> None:
     except Exception:
         pass
 
+    try:
+        # "Login" overlay that sometimes appears even when logged in
+        # Only close dialogs that look like login prompts, not other UI
+        dialogs = await page.query_selector_all('[role="dialog"]')
+        for dialog in dialogs:
+            try:
+                text = await dialog.inner_text()
+                if "log in" in text.lower() or "sign up" in text.lower():
+                    close_btn = await dialog.query_selector('[aria-label="Close"]')
+                    if close_btn:
+                        await close_btn.click()
+                        await asyncio.sleep(0.5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 async def _parse_listings(page, seen_urls: set[str]) -> list[MarketplaceListing]:
     """Parse listing cards from the current page state."""
     listings = []
 
-    # Facebook Marketplace listing cards — target the link elements
-    # that contain price and title information
-    cards = await page.query_selector_all(
-        'a[href*="/marketplace/item/"]'
-    )
+    # Strategy 1: Direct link selector (classic approach)
+    cards = await page.query_selector_all('a[href*="/marketplace/item/"]')
 
+    if not cards:
+        # Strategy 2: Facebook sometimes uses encoded URLs or different patterns
+        cards = await page.query_selector_all('a[href*="marketplace/item"]')
+
+    if not cards:
+        # Strategy 3: Extract via JavaScript - more reliable for dynamic content
+        # Facebook's React app may not have traditional href attributes visible
+        # to querySelector but the data is in the DOM
+        try:
+            card_data = await page.evaluate("""
+                () => {
+                    const results = [];
+                    // Find all links on page and filter for marketplace items
+                    const allLinks = document.querySelectorAll('a[href]');
+                    for (const link of allLinks) {
+                        const href = link.href || link.getAttribute('href') || '';
+                        if (href.includes('/marketplace/item/') || href.includes('marketplace/item')) {
+                            const text = link.innerText || '';
+                            const img = link.querySelector('img');
+                            const imgSrc = img ? (img.src || img.getAttribute('src') || '') : '';
+                            results.push({href, text, imgSrc});
+                        }
+                    }
+                    return results;
+                }
+            """)
+            if card_data:
+                logger.debug(f"JS extraction found {len(card_data)} marketplace links")
+                for item in card_data:
+                    try:
+                        href = item.get("href", "")
+                        if not href:
+                            continue
+                        if href.startswith("/"):
+                            href = f"https://www.facebook.com{href}"
+                        clean_url = href.split("?")[0]
+                        if clean_url in seen_urls:
+                            continue
+                        seen_urls.add(clean_url)
+
+                        text_content = item.get("text", "")
+                        lines = [l.strip() for l in text_content.split("\n") if l.strip()]
+                        price = _extract_price(lines)
+                        title = _extract_title(lines)
+                        location = _extract_location(lines)
+
+                        if price is None or price <= 0:
+                            continue
+
+                        listing = MarketplaceListing(
+                            title=title,
+                            price=price,
+                            url=clean_url,
+                            location=location,
+                            image_url=item.get("imgSrc", ""),
+                        )
+                        listings.append(listing)
+                    except Exception as e:
+                        logger.debug(f"Error parsing JS-extracted card: {e}")
+                return listings
+        except Exception as e:
+            logger.debug(f"JS extraction failed: {e}")
+
+    if not cards:
+        # Strategy 4: Look for listing-like containers with price patterns
+        # Facebook uses div-based cards with nested links
+        try:
+            card_data = await page.evaluate("""
+                () => {
+                    const results = [];
+                    // Look for any element that contains a $ price and a link
+                    const allElements = document.querySelectorAll('div');
+                    for (const el of allElements) {
+                        const text = el.innerText || '';
+                        // Must contain a price
+                        if (!/\\$\\d/.test(text)) continue;
+                        // Must have a marketplace link somewhere inside
+                        const link = el.querySelector('a[href*="marketplace"]') || el.querySelector('a[href*="/item/"]');
+                        if (!link) continue;
+                        const href = link.href || link.getAttribute('href') || '';
+                        if (!href.includes('/item/') && !href.includes('/marketplace/')) continue;
+                        // Must be a reasonably sized card (not the whole page)
+                        if (text.length > 500 || text.length < 5) continue;
+                        const img = el.querySelector('img');
+                        const imgSrc = img ? (img.src || '') : '';
+                        results.push({href, text, imgSrc});
+                    }
+                    return results;
+                }
+            """)
+            if card_data:
+                logger.debug(f"Div-based extraction found {len(card_data)} potential cards")
+                for item in card_data:
+                    try:
+                        href = item.get("href", "")
+                        if not href:
+                            continue
+                        if href.startswith("/"):
+                            href = f"https://www.facebook.com{href}"
+                        clean_url = href.split("?")[0]
+                        if clean_url in seen_urls:
+                            continue
+                        seen_urls.add(clean_url)
+
+                        text_content = item.get("text", "")
+                        lines = [l.strip() for l in text_content.split("\n") if l.strip()]
+                        price = _extract_price(lines)
+                        title = _extract_title(lines)
+                        location = _extract_location(lines)
+
+                        if price is None or price <= 0:
+                            continue
+
+                        listing = MarketplaceListing(
+                            title=title,
+                            price=price,
+                            url=clean_url,
+                            location=location,
+                            image_url=item.get("imgSrc", ""),
+                        )
+                        listings.append(listing)
+                    except Exception as e:
+                        logger.debug(f"Error parsing div card: {e}")
+                return listings
+        except Exception as e:
+            logger.debug(f"Div extraction failed: {e}")
+
+    # Process cards found by Strategy 1 or 2
     for card in cards:
         try:
             href = await card.get_attribute("href")
