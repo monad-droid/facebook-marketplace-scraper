@@ -15,6 +15,8 @@ import os
 import random
 import re
 import logging
+import shutil
+import subprocess
 
 from playwright.async_api import async_playwright
 
@@ -25,6 +27,56 @@ logger = logging.getLogger(__name__)
 
 FB_MARKETPLACE_URL = "https://www.facebook.com/marketplace"
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fb_cookies.json")
+
+_xvfb_process = None
+
+
+def _ensure_display():
+    """
+    Ensure a DISPLAY is available for headed Chrome.
+
+    On headless servers (no monitor), starts Xvfb virtual display.
+    This makes Chrome run in full headed mode (bypassing headless detection)
+    while rendering to a virtual framebuffer instead of a real screen.
+    """
+    global _xvfb_process
+
+    # Already have a display (desktop environment or previous xvfb)
+    if os.environ.get("DISPLAY"):
+        return
+
+    # Install xvfb if needed
+    if not shutil.which("Xvfb"):
+        logger.info("Installing xvfb for virtual display...")
+        subprocess.run(
+            ["apt-get", "install", "-y", "xvfb"],
+            capture_output=True, timeout=60,
+        )
+
+    if not shutil.which("Xvfb"):
+        logger.warning("Xvfb not available, falling back to headless mode")
+        return
+
+    # Start Xvfb on a free display
+    for display_num in range(99, 110):
+        display = f":{display_num}"
+        try:
+            _xvfb_process = subprocess.Popen(
+                ["Xvfb", display, "-screen", "0", "1920x1080x24", "-ac"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Give it a moment to start
+            import time
+            time.sleep(0.5)
+            if _xvfb_process.poll() is None:
+                os.environ["DISPLAY"] = display
+                logger.info(f"Started virtual display on {display}")
+                return
+        except Exception:
+            continue
+
+    logger.warning("Failed to start Xvfb, falling back to headless mode")
 
 
 def _build_search_url(query: str = "", max_price: int = None) -> str:
@@ -100,8 +152,16 @@ async def scrape_marketplace(
     all_listings: list[MarketplaceListing] = []
     seen_urls: set[str] = set()
 
+    # Ensure virtual display is available on headless servers
+    _ensure_display()
+
     async with async_playwright() as p:
-        launch_kwargs = {"headless": Config.HEADLESS}
+        # IMPORTANT: Use headless=False with xvfb virtual display.
+        # Facebook detects headless Chrome and refuses to render listings.
+        # Running headed mode behind a virtual display is indistinguishable
+        # from a real browser with a real monitor.
+        launch_kwargs = {"headless": False}
+
         chromium_path = os.environ.get("PLAYWRIGHT_CHROMIUM_PATH")
         if not chromium_path:
             for candidate in [
@@ -121,6 +181,9 @@ async def scrape_marketplace(
             "--no-sandbox",
             "--disable-blink-features=AutomationControlled",
             "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--window-size=1920,1080",
         ]
         browser = await p.chromium.launch(**launch_kwargs)
 
@@ -130,10 +193,33 @@ async def scrape_marketplace(
             locale="en-US",
         )
 
+        # Anti-fingerprinting: make the browser look completely normal
         await context.add_init_script("""
+            // Remove webdriver flag
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            // Normal language settings
             Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            // Real-looking plugins array
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => {
+                    const plugins = [
+                        {name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer'},
+                        {name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
+                        {name: 'Native Client', filename: 'internal-nacl-plugin'},
+                    ];
+                    plugins.length = 3;
+                    return plugins;
+                }
+            });
+            // Override permissions query
+            const origQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (params) => (
+                params.name === 'notifications' ?
+                    Promise.resolve({state: Notification.permission}) :
+                    origQuery(params)
+            );
+            // Chrome runtime
+            window.chrome = { runtime: {} };
         """)
 
         if not await _load_cookies(context):
