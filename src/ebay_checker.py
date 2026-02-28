@@ -8,7 +8,9 @@ in the past N days. This gives us real market data for pricing.
 import re
 import random
 import logging
+import time
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -19,6 +21,35 @@ from src.models import EbaySoldItem
 logger = logging.getLogger(__name__)
 
 EBAY_SOLD_URL = "https://www.ebay.com/sch/i.html"
+
+# Module-level persistent session to maintain cookies across requests
+_session: requests.Session | None = None
+_request_count = 0
+
+
+def _get_session() -> requests.Session:
+    """Get or create a persistent session with proper headers."""
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        _session.headers.update({
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "no-cache",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        })
+        # Warm up the session by visiting eBay home first
+        try:
+            _session.headers["User-Agent"] = random.choice(Config.USER_AGENTS)
+            _session.get("https://www.ebay.com/", timeout=10)
+        except Exception:
+            pass
+    return _session
 
 
 def search_ebay_sold(query: str, days: int = None) -> list[EbaySoldItem]:
@@ -32,6 +63,8 @@ def search_ebay_sold(query: str, days: int = None) -> list[EbaySoldItem]:
     Returns:
         List of EbaySoldItem with actual sale prices.
     """
+    global _request_count
+
     if days is None:
         days = Config.EBAY_SOLD_DAYS
 
@@ -44,24 +77,68 @@ def search_ebay_sold(query: str, days: int = None) -> list[EbaySoldItem]:
         "_ipg": "60",          # Results per page
     }
 
-    headers = {
-        "User-Agent": random.choice(Config.USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    }
+    session = _get_session()
+    # Rotate user agent periodically
+    if _request_count % 5 == 0:
+        session.headers["User-Agent"] = random.choice(Config.USER_AGENTS)
 
-    try:
-        response = requests.get(EBAY_SOLD_URL, params=params, headers=headers, timeout=15)
-        response.raise_for_status()
-    except requests.RequestException as e:
-        logger.error(f"eBay request failed for '{query}': {e}")
-        return []
+    # Add referer to look like normal browsing
+    session.headers["Referer"] = "https://www.ebay.com/"
+
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            response = session.get(
+                EBAY_SOLD_URL,
+                params=params,
+                timeout=15,
+                allow_redirects=True,
+            )
+
+            # Detect challenge/CAPTCHA pages
+            final_url = response.url
+            if "splashui/challenge" in final_url or "captcha" in final_url.lower():
+                logger.warning(
+                    f"eBay challenge/CAPTCHA detected (attempt {attempt + 1}). "
+                    f"Backing off..."
+                )
+                if attempt < max_retries:
+                    # Exponential backoff: 15s, 30s
+                    backoff = 15 * (2 ** attempt)
+                    logger.info(f"  Waiting {backoff}s before retry...")
+                    time.sleep(backoff)
+                    # Reset session to get fresh cookies
+                    _reset_session()
+                    session = _get_session()
+                    continue
+                else:
+                    logger.error(
+                        f"eBay blocked after {max_retries + 1} attempts for '{query}'"
+                    )
+                    return []
+
+            response.raise_for_status()
+            _request_count += 1
+            break
+
+        except requests.RequestException as e:
+            logger.error(f"eBay request failed for '{query}': {e}")
+            return []
 
     soup = BeautifulSoup(response.text, "lxml")
     items = _parse_sold_listings(soup, days)
 
     logger.info(f"Found {len(items)} sold eBay items for '{query}' in last {days} days")
     return items
+
+
+def _reset_session():
+    """Reset the session to get fresh cookies."""
+    global _session, _request_count
+    if _session:
+        _session.close()
+    _session = None
+    _request_count = 0
 
 
 def _parse_sold_listings(soup: BeautifulSoup, days: int) -> list[EbaySoldItem]:

@@ -11,6 +11,7 @@ Conservative approach:
 """
 
 import logging
+import re
 import time
 import random
 
@@ -69,14 +70,68 @@ def find_arbitrage_deals(
         else:
             logger.debug(f"  -> No profitable deal found")
 
-        # Rate limit eBay requests
-        time.sleep(random.uniform(1, 3))
+        # Rate limit eBay requests — be polite to avoid CAPTCHAs
+        time.sleep(random.uniform(3, 6))
 
     # Sort by profit percentage, best deals first
     deals.sort(key=lambda d: d.profit_percent, reverse=True)
 
     logger.info(f"Found {len(deals)} arbitrage deals out of {total} listings")
     return deals
+
+
+def _simplify_query(title: str) -> str:
+    """
+    Convert a verbose Facebook Marketplace title into a concise eBay search query.
+
+    FB titles are often like:
+      "KitchenAid 7 Hand Mixer, Onyx Black, all the attachments!!! See video"
+    We need to extract just the searchable product terms:
+      "KitchenAid Hand Mixer Onyx Black"
+    """
+    # Take only the first line (FB listings often have multi-line descriptions)
+    title = title.split("\n")[0].strip()
+
+    # Remove common FB marketplace filler phrases
+    filler_patterns = [
+        r"\b(see (video|photos?|pics?|description|details))\b",
+        r"\b(message me|text me|call me|contact me|dm me)\b",
+        r"\b(pick\s*up|local|must\s*go|need\s*gone|moving\s*sale)\b",
+        r"\b(firm|obo|or best offer|negotiable|make.?offer)\b",
+        r"\b(brand new|like new|excellent|good) condition\b",
+        r"\b(barely|never|gently|lightly) used\b",
+        r"\b(all the|with all|includes all|comes with)\b",
+        r"\b(great deal|amazing|perfect|awesome|beautiful)\b",
+        r"\b(retail(s| price)?)\s*\$?\d+\b",
+        r"\b(no (lowballers?|trades?))\b",
+        r"\bNIB\b",
+        r"\bNWT\b",
+        r"\bEUC\b",
+    ]
+    for pattern in filler_patterns:
+        title = re.sub(pattern, " ", title, flags=re.IGNORECASE)
+
+    # Remove special characters but keep alphanumeric, dots, dashes
+    title = re.sub(r"[!?*#@&()\"'\[\]{}|/\\]+", " ", title)
+
+    # Remove standalone numbers that aren't part of a model number
+    # Keep numbers attached to letters (like "K45" or "5qt")
+    title = re.sub(r"(?<![a-zA-Z])\b\d{1,2}\b(?![a-zA-Z\.])", " ", title)
+
+    # Collapse whitespace
+    title = re.sub(r"\s+", " ", title).strip()
+
+    # Limit to first ~8 meaningful words (eBay searches work best with 4-8 terms)
+    words = title.split()
+    if len(words) > 8:
+        words = words[:8]
+
+    query = " ".join(words)
+
+    # Remove trailing comma/period
+    query = query.rstrip(",.")
+
+    return query
 
 
 def _evaluate_listing(
@@ -86,8 +141,12 @@ def _evaluate_listing(
     use_conservative_pricing: bool,
 ) -> ArbitrageDeal | None:
     """Evaluate a single listing for arbitrage potential."""
+    # Simplify the FB title into a concise eBay search query
+    ebay_query = _simplify_query(listing.title)
+    logger.debug(f"  eBay search query: '{ebay_query}'")
+
     # Search eBay for sold comparables
-    market_data = get_ebay_market_value(listing.title)
+    market_data = get_ebay_market_value(ebay_query)
 
     if market_data["num_sold"] < min_sold_count:
         logger.debug(
