@@ -25,6 +25,9 @@ class Config:
     # Browser
     HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
+    # Residential proxy (needed on VPS/datacenter servers)
+    PROXY_URL = os.getenv("PROXY_URL", "").strip()
+
     # User agent rotation (keep these current — old versions get flagged)
     USER_AGENTS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",

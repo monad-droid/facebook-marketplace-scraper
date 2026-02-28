@@ -328,12 +328,32 @@ async def scrape_marketplace(
             "--disable-gpu",
             "--window-size=1920,1080",
         ]
+
+        # Proxy support — required for VPS/datacenter IPs
+        proxy_settings = None
+        if Config.PROXY_URL:
+            logger.info(f"Using proxy: {Config.PROXY_URL.split('@')[-1] if '@' in Config.PROXY_URL else Config.PROXY_URL}")
+            proxy_settings = {"server": Config.PROXY_URL}
+            # Extract username/password if present (http://user:pass@host:port)
+            if "@" in Config.PROXY_URL:
+                from urllib.parse import urlparse
+                parsed = urlparse(Config.PROXY_URL)
+                proxy_settings = {
+                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                    "username": parsed.username or "",
+                    "password": parsed.password or "",
+                }
+
+        if proxy_settings:
+            launch_kwargs["proxy"] = proxy_settings
+
         browser = await p.chromium.launch(**launch_kwargs)
 
         context = await browser.new_context(
             user_agent=random.choice(Config.USER_AGENTS),
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
+            proxy=proxy_settings if proxy_settings else None,
         )
 
         # Anti-fingerprinting: make the browser look completely normal
