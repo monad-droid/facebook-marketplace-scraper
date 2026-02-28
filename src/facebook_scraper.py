@@ -17,6 +17,7 @@ import re
 import logging
 import shutil
 import subprocess
+from urllib.parse import quote
 
 from playwright.async_api import async_playwright
 
@@ -84,7 +85,7 @@ def _build_search_url(query: str = "", max_price: int = None) -> str:
     url = f"{FB_MARKETPLACE_URL}/search/?"
     params = []
     if query:
-        params.append(f"query={query}")
+        params.append(f"query={quote(query)}")
     if max_price is not None:
         params.append(f"maxPrice={max_price}")
     params.append("sortBy=creation_time_descend")
@@ -174,6 +175,102 @@ async def _refresh_cookies(context) -> None:
         logger.info(f"Refreshed {len(clean_cookies)} cookies to {COOKIES_FILE}")
     except Exception as e:
         logger.debug(f"Cookie refresh failed (non-fatal): {e}")
+
+
+async def _is_error_page(page) -> bool:
+    """Check if the current page is Facebook's generic error page."""
+    try:
+        title = await page.title()
+        if title.strip().lower() == "error":
+            return True
+        # Also check for the "Sorry, something went wrong" text
+        content = await page.text_content("body")
+        if content and "sorry, something went wrong" in content.lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def _warmup_marketplace(page) -> bool:
+    """
+    Navigate to the Marketplace main page before searching.
+
+    Facebook is more likely to serve Marketplace if you arrive organically
+    (from the main site) rather than hitting a search URL cold.
+    Returns True if Marketplace loaded successfully.
+    """
+    try:
+        logger.info("Warming up: visiting Marketplace main page...")
+        await page.goto(
+            "https://www.facebook.com/marketplace/",
+            wait_until="domcontentloaded",
+            timeout=20000,
+        )
+        await asyncio.sleep(random.uniform(2, 4))
+
+        if await _is_error_page(page):
+            logger.warning("Marketplace main page returned error, retrying via feed link...")
+            # Try clicking the Marketplace link from the feed (more organic)
+            await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)
+            mp_link = await page.query_selector('a[href*="/marketplace"]')
+            if mp_link:
+                await mp_link.click()
+                await asyncio.sleep(3)
+                if await _is_error_page(page):
+                    return False
+            else:
+                return False
+
+        logger.info("Marketplace page loaded successfully")
+        await _dismiss_popups(page)
+        return True
+    except Exception as e:
+        logger.error(f"Marketplace warm-up failed: {e}")
+        return False
+
+
+async def _search_via_search_box(page, query: str, max_price: int) -> bool:
+    """
+    Type the search query into Marketplace's search box instead of navigating
+    to a direct URL. This is more human-like and less likely to be blocked.
+
+    Returns True if navigation succeeded (doesn't guarantee results).
+    """
+    try:
+        # Look for the Marketplace search input
+        search_input = await page.query_selector(
+            'input[placeholder*="Search Marketplace"], '
+            'input[aria-label*="Search Marketplace"], '
+            'input[placeholder*="search"], '
+            'input[type="search"]'
+        )
+        if not search_input:
+            logger.debug("No search box found on Marketplace page")
+            return False
+
+        await search_input.click()
+        await asyncio.sleep(random.uniform(0.5, 1))
+
+        # Clear existing text and type the query with human-like delays
+        await search_input.fill("")
+        for char in query:
+            await search_input.type(char, delay=random.uniform(50, 120))
+        await asyncio.sleep(random.uniform(0.5, 1))
+
+        # Press Enter to search
+        await search_input.press("Enter")
+        await asyncio.sleep(random.uniform(3, 5))
+
+        if await _is_error_page(page):
+            return False
+
+        logger.info("Search via search box succeeded")
+        return True
+    except Exception as e:
+        logger.debug(f"Search box approach failed: {e}")
+        return False
 
 
 async def scrape_marketplace(
@@ -282,6 +379,19 @@ async def scrape_marketplace(
         # This keeps the session alive across runs without manual re-login.
         await _refresh_cookies(context)
 
+        # Warm up: visit Marketplace main page first (like a real user).
+        # Going directly to search URLs from datacenter IPs often triggers
+        # Facebook's "something went wrong" error page.
+        marketplace_ok = await _warmup_marketplace(page)
+        if not marketplace_ok:
+            logger.error(
+                "Facebook Marketplace is not accessible from this IP/account. "
+                "This usually means Facebook is blocking datacenter IPs. "
+                "Consider using a residential proxy."
+            )
+            await browser.close()
+            return []
+
         for query in queries:
             try:
                 listings = await _scrape_query(
@@ -329,12 +439,29 @@ async def _scrape_query(
     page.on("response", _handle_response)
 
     try:
+        # Try direct URL first
         try:
             await page.goto(url, wait_until="networkidle", timeout=30000)
         except Exception:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        await asyncio.sleep(random.uniform(4, 6))
+        await asyncio.sleep(random.uniform(3, 5))
+
+        # If direct URL hit an error page, fall back to search box
+        if await _is_error_page(page):
+            logger.warning("Direct search URL returned error page, trying search box...")
+            # Navigate back to Marketplace main page
+            await page.goto(
+                "https://www.facebook.com/marketplace/",
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+            await asyncio.sleep(random.uniform(2, 3))
+            if not await _search_via_search_box(page, query, max_price):
+                logger.error(f"Both search methods failed for '{query}'")
+                await _save_debug_info(page, query)
+                return []
+
         await _dismiss_popups(page)
         await asyncio.sleep(1)
 
