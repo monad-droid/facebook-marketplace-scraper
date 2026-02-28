@@ -130,6 +130,52 @@ async def _verify_login(page) -> bool:
         return False
 
 
+async def _refresh_cookies(context) -> None:
+    """
+    Save refreshed cookies back to disk after a successful page load.
+
+    Facebook rotates session tokens (especially 'xs') on each visit.
+    By capturing the updated cookies and writing them back, the session
+    stays alive across runs — no manual re-login needed as long as the
+    scraper runs every few days.
+    """
+    try:
+        all_cookies = await context.cookies(["https://www.facebook.com"])
+        # Only keep the essential Facebook cookies
+        fb_cookies = [
+            c for c in all_cookies
+            if c.get("domain", "").endswith("facebook.com")
+            and c.get("name") in ("c_user", "xs", "datr", "fr", "sb", "wd")
+        ]
+        if not fb_cookies:
+            return
+
+        # Ensure we have the critical ones
+        names = {c["name"] for c in fb_cookies}
+        if "c_user" not in names or "xs" not in names:
+            return
+
+        # Convert to the simple format login.py uses (strip expires/session fields
+        # that Playwright adds, so the file stays clean)
+        clean_cookies = []
+        for c in fb_cookies:
+            clean_cookies.append({
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c["domain"],
+                "path": c.get("path", "/"),
+                "secure": c.get("secure", True),
+                "httpOnly": c.get("httpOnly", False),
+                "sameSite": c.get("sameSite", "None"),
+            })
+
+        with open(COOKIES_FILE, "w") as f:
+            json.dump(clean_cookies, f, indent=2)
+        logger.info(f"Refreshed {len(clean_cookies)} cookies to {COOKIES_FILE}")
+    except Exception as e:
+        logger.debug(f"Cookie refresh failed (non-fatal): {e}")
+
+
 async def scrape_marketplace(
     queries: list[str],
     max_price: int = None,
@@ -231,6 +277,10 @@ async def scrape_marketplace(
         if not await _verify_login(page):
             await browser.close()
             return []
+
+        # Save refreshed cookies — Facebook rotates session tokens on each visit.
+        # This keeps the session alive across runs without manual re-login.
+        await _refresh_cookies(context)
 
         for query in queries:
             try:
