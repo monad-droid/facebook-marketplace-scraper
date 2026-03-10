@@ -12,3 +12,6 @@ venv/
 results/
 screenshots/
 .playwright/
+tracker.db
+tracker.db-wal
+tracker.db-shm

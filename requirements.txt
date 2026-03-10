@@ -4,3 +4,4 @@ lxml>=4.9.0
 playwright>=1.40.0
 python-dotenv>=1.0.0
 rich>=13.0.0
+python-telegram-bot[job-queue]>=21.0
